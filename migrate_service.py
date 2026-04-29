@@ -1,67 +1,55 @@
-import httpx
-from bs4 import BeautifulSoup
 import asyncio
 import re
 import logging
 from typing import List, Dict, Any
+from pyrogram import Client, filters
+from pyrogram.enums import PollType
 from quiz_generator import QuizGenerator
 
 logger = logging.getLogger(__name__)
 
 class Migrator:
-    def __init__(self, quiz_gen: QuizGenerator):
+    def __init__(self, app: Client, ai_db: Any, quiz_gen: QuizGenerator):
+        self.app = app
+        self.ai_db = ai_db
         self.quiz_gen = quiz_gen
 
-    async def fetch_message(self, channel: str, msg_id: int):
-        url = f"https://t.me/{channel}/{msg_id}?embed=1"
-        async with httpx.AsyncClient() as client:
-            try:
-                resp = await client.get(url, timeout=10)
-                if resp.status_code == 200:
-                    return resp.text
-            except Exception as e:
-                logger.error(f"Failed to fetch {url}: {e}")
-        return None
-
-    def parse_poll(self, html: str, msg_id: int):
-        if not html: return None
-        soup = BeautifulSoup(html, 'html.parser')
-        
-        # Look for poll question
-        poll_question_elem = soup.select_one('.tgme_widget_message_poll_question')
-        message_text_elem = soup.select_one('.tgme_widget_message_text')
-        
-        question = ""
-        if poll_question_elem:
-            question = poll_question_elem.get_text(strip=True)
-        elif message_text_elem:
-            question = message_text_elem.get_text(strip=True)
-            
-        if not question: return None
-            
-        options = []
-        for opt in soup.select('.tgme_widget_message_poll_option_text'):
-            options.append(opt.get_text(strip=True))
-            
-        if not options: return None
-            
-        # Try to detect correct index if marked (rare in web embed)
-        correct_index = 0
-        correct_elem = soup.select_one('.tgme_widget_message_poll_option_correct')
-        if correct_elem:
-            for i, opt in enumerate(soup.select('.tgme_widget_message_poll_option')):
-                if 'tgme_widget_message_poll_option_correct' in opt.get('class', []):
-                    correct_index = i
-                    break
-
-        return {
-            "msg_id": msg_id,
-            "question": question,
-            "options": options,
-            "correct_index": correct_index,
-            "explanation": "✨ Sources: External Channel | @Quiz_Masterx"
-        }
-
+    async def migrate_channel(self, source_chat: str, target_chat: str, limit: int = 10):
+        """Migrates quizzes from source channel to target channel with AI enhancements."""
+        count = 0
+        async for message in self.app.get_chat_history(source_chat, limit=limit * 2): # Look a bit further
+            if count >= limit:
+                break
+                
+            if message.poll:
+                # 1. Extract details
+                question = message.poll.question
+                options = [opt.text for opt in message.poll.options]
+                
+                # 2. Get correct index using AI (if not accessible)
+                # Note: For public polls, we often don't know the correct answer unless we vote.
+                # AI can guess the correct one.
+                correct_idx = await self.get_correct_answer_ai(question, options)
+                
+                # 3. Generate explanation
+                explanation = await self.get_explanation_ai(question, options, correct_idx)
+                
+                # 4. Post to target
+                try:
+                    await self.app.send_poll(
+                        chat_id=target_chat,
+                        question=question,
+                        options=options,
+                        is_anonymous=True,
+                        type=PollType.QUIZ,
+                        correct_option_id=correct_idx,
+                        explanation=f"📝 {explanation}\n\n@Quiz_Masterx"
+                    )
+                    count += 1
+                    await asyncio.sleep(2) # Avoid flood
+                except Exception as e:
+                    logger.error(f"Failed to post migrated poll: {e}")
+                    
     async def get_correct_answer_ai(self, question: str, options: List[str]) -> int:
         """Uses AI to determine the correct answer from options."""
         prompt = (
@@ -109,39 +97,3 @@ class Migrator:
         except Exception as e:
             logger.error(f"AI explanation generation failed: {e}")
             return f"The correct answer is {correct_answer}."
-
-    async def migrate_batch(self, link: str, count: int, callback=None):
-        """Extracts and prepares a batch of quizzes."""
-        match = re.search(r't\.me/([^/]+)/(\d+)', link)
-        if not match:
-            raise ValueError("Invalid Telegram message link.")
-            
-        channel = match.group(1)
-        start_id = int(match.group(2))
-        
-        quizzes = []
-        current_id = start_id
-        searched = 0
-        
-        while len(quizzes) < count and searched < 200:
-            if callback: await callback(len(quizzes), searched)
-            
-            html = await self.fetch_message(channel, current_id)
-            poll = self.parse_poll(html, current_id)
-            
-            if poll:
-                # 1. Detect correct index
-                if poll['correct_index'] == 0:
-                    poll['correct_index'] = await self.get_correct_answer_ai(poll['question'], poll['options'])
-                
-                # 2. Generate proper explanation
-                explanation = await self.get_explanation_ai(poll['question'], poll['options'], poll['correct_index'])
-                poll['explanation'] = f"📝 {explanation}\n\n✅ Correct: {poll['options'][poll['correct_index']]}\n\n@Quiz_Masterx"
-                
-                quizzes.append(poll)
-                
-            current_id += 1
-            searched += 1
-            await asyncio.sleep(1)
-            
-        return quizzes
